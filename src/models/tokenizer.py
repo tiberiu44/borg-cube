@@ -1,0 +1,180 @@
+"""Tokenizer model: sentence and token boundary detection."""
+from __future__ import annotations
+
+import os
+from typing import Any, Dict, List, Optional
+
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+from transformers import get_linear_schedule_with_warmup
+
+from src.config import BorgConfig
+from src.data.conllu import Sentence, Token
+from src.data.dataset import TokenizerDataset
+from src.models.base import BorgBaseModel
+
+_LABELS = {0: "C", 1: "T", 2: "S"}  # Continuation / Token-start / Sentence-start
+
+
+class TokenizerModel(BorgBaseModel):
+    """Predicts sentence/token boundaries at sub-word level."""
+
+    NUM_LABELS = 3  # CONTINUATION, TOKEN_START, SENTENCE_START
+
+    def __init__(self, config: BorgConfig):
+        super().__init__(config, "tokenizer")
+        self.classifier = nn.Linear(self.hidden_size, self.NUM_LABELS)
+
+    def forward(
+        self, input_ids: torch.Tensor, attention_mask: torch.Tensor
+    ) -> torch.Tensor:
+        hidden = self.encode(input_ids, attention_mask)  # (B, L, H)
+        return self.classifier(hidden)  # (B, L, num_labels)
+
+    # ------------------------------------------------------------------
+    def _get_extras(self) -> Dict[str, Any]:
+        return {"classifier": self.classifier.state_dict()}
+
+    def _set_extras(self, extras: Dict[str, Any]) -> None:
+        self.classifier.load_state_dict(extras["classifier"])
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def train_model(
+        train_sentences: List[Sentence],
+        dev_sentences: List[Sentence],
+        config: BorgConfig,
+        model_path: str,
+    ) -> "TokenizerModel":
+        device = config.resolve_device()
+        torch.manual_seed(config.seed)
+
+        model = TokenizerModel(config).to(device)
+        train_ds = TokenizerDataset(train_sentences, config.model_name, config.max_seq_length)
+        dev_ds = TokenizerDataset(dev_sentences, config.model_name, config.max_seq_length)
+
+        train_loader = DataLoader(train_ds, batch_size=config.batch_size, shuffle=True)
+        dev_loader = DataLoader(dev_ds, batch_size=config.eval_batch_size)
+
+        optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
+        total_steps = len(train_loader) * config.num_epochs
+        warmup_steps = int(total_steps * config.warmup_ratio)
+        scheduler = get_linear_schedule_with_warmup(optimizer, warmup_steps, total_steps)
+        loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
+
+        best_acc = -1.0
+        for epoch in range(config.num_epochs):
+            model.train()
+            total_loss = 0.0
+            for batch in tqdm(train_loader, desc=f"[Tokenizer] Epoch {epoch + 1}"):
+                input_ids = batch["input_ids"].to(device)
+                attention_mask = batch["attention_mask"].to(device)
+                labels = batch["labels"].to(device)
+
+                logits = model(input_ids, attention_mask)  # (B, L, C)
+                loss = loss_fn(logits.view(-1, TokenizerModel.NUM_LABELS), labels.view(-1))
+                optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+                scheduler.step()
+                total_loss += loss.item()
+
+            avg_loss = total_loss / len(train_loader)
+
+            # Validation
+            model.eval()
+            correct = total = 0
+            with torch.no_grad():
+                for batch in dev_loader:
+                    input_ids = batch["input_ids"].to(device)
+                    attention_mask = batch["attention_mask"].to(device)
+                    labels = batch["labels"].to(device)
+                    logits = model(input_ids, attention_mask)
+                    preds = logits.argmax(-1)
+                    mask = labels != -100
+                    correct += (preds[mask] == labels[mask]).sum().item()
+                    total += mask.sum().item()
+
+            acc = correct / max(total, 1)
+            print(f"  loss={avg_loss:.4f}  dev_acc={acc:.4f}")
+            if acc > best_acc:
+                best_acc = acc
+                model.save(model_path)
+
+        return model
+
+    # ------------------------------------------------------------------
+    def predict(self, text: str) -> List[Sentence]:
+        """Segment *text* into sentences and tokens."""
+        device = self.config.resolve_device()
+        self.eval()
+
+        hf_tok = self.hf_tokenizer
+        encoding = hf_tok(
+            text,
+            return_offsets_mapping=True,
+            max_length=self.config.max_seq_length,
+            truncation=True,
+            return_tensors="pt",
+        )
+        offset_mapping = encoding.pop("offset_mapping").squeeze(0)
+        input_ids = encoding["input_ids"].to(device)
+        attention_mask = encoding["attention_mask"].to(device)
+
+        with torch.no_grad():
+            logits = self(input_ids, attention_mask)  # (1, L, C)
+        preds = logits.squeeze(0).argmax(-1).cpu().tolist()
+
+        sentences: List[Sentence] = []
+        current_sentence: Optional[Sentence] = None
+        current_form_chars: List[str] = []
+        current_token_id = 1
+
+        for i, (start, end) in enumerate(offset_mapping.tolist()):
+            if start == 0 and end == 0:
+                continue  # special token
+            label = preds[i]
+            subword = text[start:end]
+
+            if label == TokenizerDataset.SENTENCE_START:
+                # Flush any pending token
+                if current_form_chars and current_sentence is not None:
+                    current_sentence.tokens.append(
+                        Token(id=current_token_id, form="".join(current_form_chars))
+                    )
+                # Flush old sentence
+                if current_sentence is not None and current_sentence.tokens:
+                    sentences.append(current_sentence)
+                current_sentence = Sentence()
+                current_form_chars = [subword]
+                current_token_id = 1
+
+            elif label == TokenizerDataset.TOKEN_START:
+                if current_sentence is None:
+                    current_sentence = Sentence()
+                    current_token_id = 1
+                if current_form_chars:
+                    current_sentence.tokens.append(
+                        Token(id=current_token_id, form="".join(current_form_chars))
+                    )
+                    current_token_id += 1
+                current_form_chars = [subword]
+
+            else:  # CONTINUATION
+                if current_sentence is None:
+                    current_sentence = Sentence()
+                    current_token_id = 1
+                current_form_chars.append(subword)
+
+        # Flush remaining
+        if current_form_chars and current_sentence is not None:
+            current_sentence.tokens.append(
+                Token(id=current_token_id, form="".join(current_form_chars))
+            )
+        if current_sentence is not None and current_sentence.tokens:
+            sentences.append(current_sentence)
+
+        return sentences

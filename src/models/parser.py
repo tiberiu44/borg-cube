@@ -1,0 +1,291 @@
+"""Dependency parser: biaffine attention for HEAD + linear head for DEPREL."""
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional
+
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+from transformers import get_linear_schedule_with_warmup
+
+from src.config import BorgConfig
+from src.data.conllu import Sentence, Token
+from src.data.dataset import ParserDataset, _build_vocab
+from src.models.base import BorgBaseModel
+
+
+# ---------------------------------------------------------------------------
+# Biaffine attention
+# ---------------------------------------------------------------------------
+
+class BiaffineAttention(nn.Module):
+    """Biaffine scoring: score[b,i,j] = dep[b,i] W head[b,j]."""
+
+    def __init__(self, in_features: int, out_features: int = 1):
+        super().__init__()
+        self.out_features = out_features
+        # Weight tensor shape: (out_features, in_features+1, in_features+1)
+        self.weight = nn.Parameter(
+            torch.empty(out_features, in_features + 1, in_features + 1)
+        )
+        nn.init.xavier_uniform_(self.weight)
+
+    def forward(self, h_dep: torch.Tensor, h_head: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            h_dep:  (B, N, H)
+            h_head: (B, N, H)
+        Returns:
+            scores: (B, N, N) when out_features==1
+                    (B, N, N, out_features) when out_features>1
+        """
+        batch, seq_len, hidden = h_dep.shape
+        ones = torch.ones(batch, seq_len, 1, device=h_dep.device, dtype=h_dep.dtype)
+        h_dep = torch.cat([h_dep, ones], dim=-1)    # (B, N, H+1)
+        h_head = torch.cat([h_head, ones], dim=-1)  # (B, N, H+1)
+
+        # einsum: b i h, o h k, b j k -> b i j o
+        scores = torch.einsum("bih,ohk,bjk->bijo", h_dep, self.weight, h_head)
+        if self.out_features == 1:
+            return scores.squeeze(-1)  # (B, N, N)
+        return scores  # (B, N, N, O)
+
+
+# ---------------------------------------------------------------------------
+# Parser model
+# ---------------------------------------------------------------------------
+
+class ParserModel(BorgBaseModel):
+    """Biaffine dependency parser."""
+
+    ARC_HIDDEN = 512
+    REL_HIDDEN = 128
+
+    def __init__(
+        self,
+        config: BorgConfig,
+        deprel_vocab: Optional[Dict[str, int]] = None,
+    ):
+        super().__init__(config, "parser")
+        self.deprel_vocab = deprel_vocab or {"<PAD>": 0, "<UNK>": 1}
+        self._build_heads()
+
+    def _build_heads(self) -> None:
+        H = self.hidden_size
+        # Arc MLP
+        self.arc_head_mlp = nn.Sequential(nn.Linear(H, self.ARC_HIDDEN), nn.ELU())
+        self.arc_dep_mlp = nn.Sequential(nn.Linear(H, self.ARC_HIDDEN), nn.ELU())
+        self.arc_biaffine = BiaffineAttention(self.ARC_HIDDEN, out_features=1)
+
+        # Relation MLP
+        self.rel_head_mlp = nn.Sequential(nn.Linear(H, self.REL_HIDDEN), nn.ELU())
+        self.rel_dep_mlp = nn.Sequential(nn.Linear(H, self.REL_HIDDEN), nn.ELU())
+        n_rels = len(self.deprel_vocab)
+        self.rel_biaffine = BiaffineAttention(self.REL_HIDDEN, out_features=n_rels)
+
+    def forward(
+        self, input_ids: torch.Tensor, attention_mask: torch.Tensor
+    ) -> tuple:
+        """Returns (arc_scores, rel_scores)."""
+        hidden = self.encode(input_ids, attention_mask)  # (B, L, H)
+
+        h_arc_head = self.arc_head_mlp(hidden)  # (B, L, arc_h)
+        h_arc_dep = self.arc_dep_mlp(hidden)
+        arc_scores = self.arc_biaffine(h_arc_dep, h_arc_head)  # (B, L, L)
+
+        h_rel_head = self.rel_head_mlp(hidden)  # (B, L, rel_h)
+        h_rel_dep = self.rel_dep_mlp(hidden)
+        rel_scores = self.rel_biaffine(h_rel_dep, h_rel_head)  # (B, L, L, n_rels)
+
+        return arc_scores, rel_scores
+
+    # ------------------------------------------------------------------
+    def _get_extras(self) -> Dict[str, Any]:
+        return {
+            "deprel_vocab": self.deprel_vocab,
+            "arc_head_mlp": self.arc_head_mlp.state_dict(),
+            "arc_dep_mlp": self.arc_dep_mlp.state_dict(),
+            "arc_biaffine": self.arc_biaffine.state_dict(),
+            "rel_head_mlp": self.rel_head_mlp.state_dict(),
+            "rel_dep_mlp": self.rel_dep_mlp.state_dict(),
+            "rel_biaffine": self.rel_biaffine.state_dict(),
+        }
+
+    def _set_extras(self, extras: Dict[str, Any]) -> None:
+        self.deprel_vocab = extras["deprel_vocab"]
+        self._build_heads()
+        self.arc_head_mlp.load_state_dict(extras["arc_head_mlp"])
+        self.arc_dep_mlp.load_state_dict(extras["arc_dep_mlp"])
+        self.arc_biaffine.load_state_dict(extras["arc_biaffine"])
+        self.rel_head_mlp.load_state_dict(extras["rel_head_mlp"])
+        self.rel_dep_mlp.load_state_dict(extras["rel_dep_mlp"])
+        self.rel_biaffine.load_state_dict(extras["rel_biaffine"])
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def train_model(
+        train_sentences: List[Sentence],
+        dev_sentences: List[Sentence],
+        config: BorgConfig,
+        model_path: str,
+    ) -> "ParserModel":
+        device = config.resolve_device()
+        torch.manual_seed(config.seed)
+
+        all_deprels = [t.deprel for s in train_sentences for t in s.regular_tokens()]
+        deprel_vocab = _build_vocab(all_deprels)
+
+        model = ParserModel(config, deprel_vocab).to(device)
+
+        train_ds = ParserDataset(
+            train_sentences, config.model_name, config.max_seq_length, deprel_vocab
+        )
+        dev_ds = ParserDataset(
+            dev_sentences, config.model_name, config.max_seq_length, deprel_vocab
+        )
+        train_loader = DataLoader(train_ds, batch_size=config.batch_size, shuffle=True)
+        dev_loader = DataLoader(dev_ds, batch_size=config.eval_batch_size)
+
+        optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
+        total_steps = len(train_loader) * config.num_epochs
+        warmup_steps = int(total_steps * config.warmup_ratio)
+        scheduler = get_linear_schedule_with_warmup(optimizer, warmup_steps, total_steps)
+        arc_loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
+        rel_loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
+
+        best_uas = -1.0
+
+        for epoch in range(config.num_epochs):
+            model.train()
+            total_loss = 0.0
+
+            for batch in tqdm(train_loader, desc=f"[Parser] Epoch {epoch + 1}"):
+                input_ids = batch["input_ids"].to(device)
+                attention_mask = batch["attention_mask"].to(device)
+                head_labels = batch["head_labels"].to(device)       # (B, L)
+                deprel_labels = batch["deprel_labels"].to(device)   # (B, L)
+
+                arc_scores, rel_scores = model(input_ids, attention_mask)
+                # arc_scores: (B, L, L) — rows=dep, cols=head
+                B, L, _ = arc_scores.shape
+
+                arc_loss = arc_loss_fn(
+                    arc_scores.view(B * L, L),
+                    head_labels.view(B * L),
+                )
+
+                # For relation loss, gather scores at the gold head position
+                # rel_scores: (B, L, L, n_rels)
+                head_idx = head_labels.clamp(min=0)  # avoid -100 for gather
+                head_expand = head_idx.unsqueeze(-1).unsqueeze(-1).expand(B, L, 1, rel_scores.size(-1))
+                rel_at_gold = rel_scores.gather(2, head_expand).squeeze(2)  # (B, L, n_rels)
+                mask = deprel_labels != -100
+                rel_loss = rel_loss_fn(
+                    rel_at_gold.view(B * L, -1),
+                    deprel_labels.view(B * L),
+                )
+
+                loss = arc_loss + rel_loss
+                optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+                scheduler.step()
+                total_loss += loss.item()
+
+            avg_loss = total_loss / len(train_loader)
+
+            # Validation UAS
+            model.eval()
+            correct_arc = total_arc = 0
+            with torch.no_grad():
+                for batch in dev_loader:
+                    input_ids = batch["input_ids"].to(device)
+                    attention_mask = batch["attention_mask"].to(device)
+                    head_labels = batch["head_labels"].to(device)
+                    arc_scores, _ = model(input_ids, attention_mask)
+                    preds = arc_scores.argmax(-1)
+                    mask = head_labels != -100
+                    correct_arc += (preds[mask] == head_labels[mask]).sum().item()
+                    total_arc += mask.sum().item()
+
+            uas = correct_arc / max(total_arc, 1)
+            print(f"  loss={avg_loss:.4f}  dev_UAS={uas:.4f}")
+            if uas > best_uas:
+                best_uas = uas
+                model.save(model_path)
+
+        return model
+
+    # ------------------------------------------------------------------
+    def predict(self, sentences: List[Sentence]) -> List[Sentence]:
+        device = self.config.resolve_device()
+        self.eval()
+        self.to(device)
+
+        inv_deprel = {v: k for k, v in self.deprel_vocab.items()}
+        hf_tok = self.hf_tokenizer
+        results: List[Sentence] = []
+
+        for sent in sentences:
+            tokens = sent.regular_tokens()
+            if not tokens:
+                results.append(sent)
+                continue
+            forms = [t.form for t in tokens]
+
+            encoding = hf_tok(
+                forms,
+                is_split_into_words=True,
+                max_length=self.config.max_seq_length,
+                truncation=True,
+                return_tensors="pt",
+            )
+            word_ids = encoding.word_ids(batch_index=0)
+            input_ids = encoding["input_ids"].to(device)
+            attention_mask = encoding["attention_mask"].to(device)
+
+            with torch.no_grad():
+                arc_scores, rel_scores = self(input_ids, attention_mask)
+
+            arc_preds = arc_scores.squeeze(0).argmax(-1).cpu().tolist()  # (L,)
+            rel_scores_sq = rel_scores.squeeze(0)  # (L, L, n_rels)
+
+            # Map sub-word positions back to word positions
+            word_positions: Dict[int, int] = {}
+            for i, wid in enumerate(word_ids):
+                if wid is not None and wid not in word_positions:
+                    word_positions[wid] = i  # first subword of word wid
+
+            inv_word_positions = {pos: wid for wid, pos in word_positions.items()}
+
+            word_heads: Dict[int, int] = {}
+            word_deprels: Dict[int, str] = {}
+            for wid, pos in word_positions.items():
+                pred_head_pos = arc_preds[pos]
+                # Convert subword position to word index
+                pred_head_wid = inv_word_positions.get(pred_head_pos, 0)
+                word_heads[wid] = pred_head_wid + 1  # 1-based
+                # Get relation
+                rel_logits = rel_scores_sq[pos, pred_head_pos]  # (n_rels,)
+                rel_id = rel_logits.argmax(-1).item()
+                word_deprels[wid] = inv_deprel.get(rel_id, "_")  # type: ignore[arg-type]
+
+            new_sent = Sentence(comments=sent.comments)
+            for tok in sent.tokens:
+                if tok.is_multiword() or tok.is_empty():
+                    new_sent.tokens.append(tok)
+                    continue
+                tid = tok.id - 1
+                new_tok = Token(
+                    id=tok.id, form=tok.form, lemma=tok.lemma,
+                    upos=tok.upos, xpos=tok.xpos, feats=tok.feats,
+                    head=word_heads.get(tid, 0),
+                    deprel=word_deprels.get(tid, "_"),
+                    deps=tok.deps, misc=tok.misc,
+                )
+                new_sent.tokens.append(new_tok)
+            results.append(new_sent)
+
+        return results
