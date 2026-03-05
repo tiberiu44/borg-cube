@@ -12,7 +12,7 @@ from src.config import BorgConfig
 
 
 class BorgBaseModel(nn.Module):
-    """Wraps a DeBERTa-v3 encoder with a task-specific LoRA adapter."""
+    """Wraps a DeBERTa-v3 encoder with a task-specific Pfeiffer adapter."""
 
     def __init__(self, config: BorgConfig, component: str):
         super().__init__()
@@ -25,8 +25,8 @@ class BorgBaseModel(nn.Module):
         self.hf_tokenizer = AutoTokenizer.from_pretrained(config.model_name)
         self.encoder = AutoModel.from_pretrained(config.model_name)
         adapters.init(self.encoder)
-        lora_cfg = adapters.LoRAConfig(r=16, alpha=16)
-        self.encoder.add_adapter(component, config=lora_cfg)
+        pfeiffer_cfg = adapters.PfeifferConfig(reduction_factor=6)
+        self.encoder.add_adapter(component, config=pfeiffer_cfg)
         self.encoder.set_active_adapters(component)
         self.encoder.train_adapter(component)
 
