@@ -349,5 +349,78 @@ class TestCubeAPI(unittest.TestCase):
         self.assertIn("de", r)
 
 
+# ---------------------------------------------------------------------------
+# 7. Adapter configuration
+# ---------------------------------------------------------------------------
+
+class TestAdapterConfig(unittest.TestCase):
+
+    def test_pfeiffer_adapter_used_in_base(self):
+        """BorgBaseModel must configure a Pfeiffer adapter with reduction_factor=6."""
+        import ast
+
+        base_path = os.path.join(ROOT, "src", "models", "base.py")
+        with open(base_path) as fh:
+            source = fh.read()
+
+        tree = ast.parse(source)
+
+        pfeiffer_calls = [
+            node
+            for node in ast.walk(tree)
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "PfeifferConfig"
+            )
+        ]
+
+        self.assertTrue(
+            pfeiffer_calls,
+            "Expected at least one call to adapters.PfeifferConfig in base.py",
+        )
+
+        # Every PfeifferConfig call must pass reduction_factor=6
+        for call in pfeiffer_calls:
+            reduction_factors = [
+                ast.literal_eval(kw.value)
+                for kw in call.keywords
+                if kw.arg == "reduction_factor"
+            ]
+            self.assertTrue(
+                reduction_factors,
+                "PfeifferConfig called without a reduction_factor keyword argument",
+            )
+            self.assertTrue(
+                all(rf == 6 for rf in reduction_factors),
+                f"All PfeifferConfig calls must use reduction_factor=6; got {reduction_factors}",
+            )
+
+    def test_lora_not_used_in_base(self):
+        """BorgBaseModel must not use LoRAConfig."""
+        import ast
+
+        base_path = os.path.join(ROOT, "src", "models", "base.py")
+        with open(base_path) as fh:
+            source = fh.read()
+
+        tree = ast.parse(source)
+
+        lora_calls = [
+            node
+            for node in ast.walk(tree)
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "LoRAConfig"
+            )
+        ]
+
+        self.assertFalse(
+            lora_calls,
+            "LoRAConfig should no longer be used in base.py; use PfeifferConfig instead",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
