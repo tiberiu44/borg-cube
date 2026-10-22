@@ -51,12 +51,6 @@ class LemmatizerModel(BorgBaseModel):
             "<SOS>": 2,
             "<EOS>": 3
         }
-        self.input_vocab = input_vocab or {
-            "<PAD>": 0,
-            "<UNK>": 1,
-            "<SOS>": 2,
-            "<EOS>": 3
-        }
 
         self._build_heads()
 
@@ -71,12 +65,6 @@ class LemmatizerModel(BorgBaseModel):
             padding_idx=0,
         )
         
-        self.input_embedding = nn.Embedding(
-            len(self.input_vocab),
-            char_emb_dim,
-            padding_idx=0,
-        )
-
         self.output_embedding = nn.Embedding(
             len(self.output_vocab),
             char_emb_dim,
@@ -84,31 +72,16 @@ class LemmatizerModel(BorgBaseModel):
         )
         
         self.output_logit = nn.Linear(
-            lstm_size * 2,
+            lstm_size,
             len(self.output_vocab)
         )
 
-        self.input_encoder=nn.LSTM(
-            input_size=upos_emb_dim+char_emb_dim+self.encoder.config.hidden_size,
+        self.output_decoder=nn.LSTM(
+            input_size=char_emb_dim + upos_emb_dim+self.encoder.config.hidden_size,
             hidden_size=lstm_size,
             num_layers=2,
             batch_first=True,
-            bidirectional=True,
-        )
-
-        self.output_decoder=nn.LSTM(
-            input_size=lstm_size * 2+char_emb_dim,
-            hidden_size=lstm_size * 2,
-            num_layers=1,
-            batch_first=True,
             bidirectional=False,
-        )
-        self.attention=nn.MultiheadAttention(
-            embed_dim=lstm_size*2,
-            num_heads=1,
-            batch_first=True,
-            kdim=lstm_size*2,
-            vdim=lstm_size*2   
         )
         
 
@@ -136,20 +109,15 @@ class LemmatizerModel(BorgBaseModel):
         )  # (B, L, H+E)
 
         concat=concat[:,1:-1,:]
-        concat=concat.reshape((concat.shape[0]*concat.shape[1], -1))
-        input_char_ids=input_char_ids.reshape((input_char_ids.shape[0]*input_char_ids.shape[1], input_char_ids.shape[2]))
+        concat=concat.reshape((concat.shape[0]*concat.shape[1], -1)).unsqueeze(1)
+        # input_char_ids=input_char_ids.reshape((input_char_ids.shape[0]*input_char_ids.shape[1], input_char_ids.shape[2]))
         output_char_ids=output_char_ids.reshape((output_char_ids.shape[0]*output_char_ids.shape[1], output_char_ids.shape[2])) if output_char_ids is not None else None
-        
-        input_char_emb = self.input_embedding(input_char_ids)
-        concat=concat.unsqueeze(1).repeat(1, input_char_emb.shape[1], 1)
-        input_embedding= torch.cat([concat, input_char_emb], dim=-1)
-        encoder_states, _=self.input_encoder(input_embedding)
-        
+                
         output_strings=["" for _ in range(input_char_ids.shape[0])]
         finished = [False for _ in output_strings]
         inverse_output_vocab = {value: key for key, value in self.output_vocab.items()}
         output_logits=[]
-        last_output_embeddings=torch.zeros((input_char_ids.shape[0], 1, input_char_emb.shape[2]+encoder_states.shape[2]), device=encoder_states.device)
+        last_output_embeddings=torch.zeros((concat.shape[0], 1, concat.shape[2]+64), device=concat.device)
         decoder_hidden=None
         if output_char_ids is not None:
             output_char_ids=torch.clamp(output_char_ids, min=0)
@@ -174,12 +142,7 @@ class LemmatizerModel(BorgBaseModel):
                         output_strings[index] += inverse_output_vocab.get(char_id, "")
                 if all(finished):
                     break
-            attention_output, _=self.attention(
-                query=decoder_output,
-                key=encoder_states,
-                value=encoder_states,
-            )
-            last_output_embeddings=torch.cat([output_char_emb, attention_output], dim=-1)
+            last_output_embeddings=torch.cat([output_char_emb, concat], dim=-1)
         # from ipdb import set_trace; set_trace()
         return {
             "logits": torch.cat(output_logits, dim=1),
@@ -190,15 +153,11 @@ class LemmatizerModel(BorgBaseModel):
     def _get_extras(self) -> Dict[str, Any]:
         return {
             "upos_vocab": self.upos_vocab,
-            "input_vocab": self.input_vocab,
             "output_vocab": self.output_vocab,
             "upos_embedding": self.upos_embedding.state_dict(),
-            "input_embedding": self.input_embedding.state_dict(),
             "output_embedding": self.output_embedding.state_dict(),
-            "input_encoder": self.input_encoder.state_dict(),
             "output_decoder": self.output_decoder.state_dict(),
             "output_logit": self.output_logit.state_dict(),
-            "attention": self.attention.state_dict(),
         }
 
     def _set_extras(
@@ -207,18 +166,14 @@ class LemmatizerModel(BorgBaseModel):
     ) -> None:
         self.upos_vocab = extras["upos_vocab"]
         self.input_vocab = extras["input_vocab"]
-        self.output_vocab = extras["output_vocab"]
 
         self._build_heads()
 
         for name in (
             "upos_embedding",
-            "input_embedding",
             "output_embedding",
-            "input_encoder",
             "output_decoder",
             "output_logit",
-            "attention",
         ):
             getattr(self, name).load_state_dict(extras[name])
 
