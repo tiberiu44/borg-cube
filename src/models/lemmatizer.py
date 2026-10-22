@@ -162,6 +162,7 @@ class LemmatizerModel(BorgBaseModel):
         extras: Dict[str, Any],
     ) -> None:
         self.upos_vocab = extras["upos_vocab"]
+        self.output_vocab = extras["output_vocab"]
 
         self._build_heads()
 
