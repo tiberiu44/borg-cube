@@ -377,7 +377,6 @@ class LemmatizerModel(BorgBaseModel):
                     batch.input_ids.to(device),
                     batch.attention_mask.to(device),
                     upos_ids.to(device),
-                    batch.input_char_ids.to(device),
                 )["strings"]
 
             for row, index in enumerate(batch.indices):
