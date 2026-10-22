@@ -74,7 +74,10 @@ def sentence_batches(
 
         input_char_ids = None
         if model.component in ("lemmatizer", "mwt"):
-            vocab = model.input_vocab
+            if model.component=="lemmatizer":
+                vocab = model.output_vocab
+            else:
+                vocab = model.input_vocab
             pad_id = vocab["<PAD>"]
             char_sequences = []
             max_char_length = max(

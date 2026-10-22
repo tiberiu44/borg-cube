@@ -36,7 +36,6 @@ class LemmatizerModel(BorgBaseModel):
         config: BorgConfig,
         upos_vocab: Optional[Dict[str, int]] = None,
         output_vocab: Optional[Dict[str, int]] = None,
-        input_vocab: Optional[Dict[str, int]] = None,
     ):
         super().__init__(config, "lemmatizer")
 
@@ -90,7 +89,6 @@ class LemmatizerModel(BorgBaseModel):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         upos_ids: torch.Tensor,
-        input_char_ids: torch.Tensor,
         output_char_ids: Optional[torch.Tensor] = None,
         max_output_length: int = 200,
     ) -> torch.Tensor:
@@ -110,10 +108,9 @@ class LemmatizerModel(BorgBaseModel):
 
         concat=concat[:,1:-1,:]
         concat=concat.reshape((concat.shape[0]*concat.shape[1], -1)).unsqueeze(1)
-        # input_char_ids=input_char_ids.reshape((input_char_ids.shape[0]*input_char_ids.shape[1], input_char_ids.shape[2]))
         output_char_ids=output_char_ids.reshape((output_char_ids.shape[0]*output_char_ids.shape[1], output_char_ids.shape[2])) if output_char_ids is not None else None
                 
-        output_strings=["" for _ in range(input_char_ids.shape[0])]
+        output_strings=["" for _ in range(concat.shape[0])]
         finished = [False for _ in output_strings]
         inverse_output_vocab = {value: key for key, value in self.output_vocab.items()}
         output_logits=[]
@@ -165,7 +162,6 @@ class LemmatizerModel(BorgBaseModel):
         extras: Dict[str, Any],
     ) -> None:
         self.upos_vocab = extras["upos_vocab"]
-        self.input_vocab = extras["input_vocab"]
 
         self._build_heads()
 
@@ -197,28 +193,22 @@ class LemmatizerModel(BorgBaseModel):
             for s in train_sentences
             for t in s.regular_tokens()
         ]
-        all_input_chars = [
-            c for s in train_sentences for t in s.regular_tokens() for c in t.form
-        ]
         all_output_chars = [
             c for s in train_sentences for t in s.regular_tokens() for c in t.lemma 
         ]
 
 
         upos_vocab = _build_vocab(all_upos)
-        input_vocab = _build_vocab(all_input_chars, initial_vocab={"<PAD>": 0, "<UNK>": 1, "<SOS>": 2, "<EOS>": 3})
         output_vocab = _build_vocab(all_output_chars, initial_vocab={"<PAD>": 0, "<UNK>": 1, "<SOS>": 2, "<EOS>": 3})
 
         if resume:
             model = LemmatizerModel.load(os.path.join(model_path, "last"), config).to(device)
             upos_vocab = model.upos_vocab
-            input_vocab = model.input_vocab
             output_vocab = model.output_vocab  
         else:
             model = LemmatizerModel(
                 config,
                 upos_vocab,
-                input_vocab,
                 output_vocab,
             ).to(device)
 
@@ -227,7 +217,6 @@ class LemmatizerModel(BorgBaseModel):
             config.model_name,
             config.max_seq_length,
             upos_vocab,
-            input_vocab,
             output_vocab,
         )
 
@@ -282,10 +271,6 @@ class LemmatizerModel(BorgBaseModel):
                         "upos_ids"
                     ].to(device)
 
-                    input_char_ids = batch[
-                        "input_char_ids"
-                    ].to(device)
-
                     output_char_ids = batch[
                         "output_char_ids"
                     ].to(device)
@@ -301,7 +286,6 @@ class LemmatizerModel(BorgBaseModel):
                             input_ids,
                             attention_mask,
                             upos_ids,
-                            input_char_ids,
                             output_char_ids
                         )['logits']
                         loss = loss_fn(

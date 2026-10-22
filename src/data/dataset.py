@@ -383,7 +383,6 @@ class LemmatizerDataset(Dataset):
         hf_tokenizer_name: str,
         max_length: int = 512,
         upos_vocab: Optional[Dict[str, int]] = None,
-        input_vocab: Optional[Dict[str, int]] = None,
         output_vocab: Optional[Dict[str, int]] = None
     ):
         self.hf_tok = AutoTokenizer.from_pretrained(hf_tokenizer_name)
@@ -392,10 +391,8 @@ class LemmatizerDataset(Dataset):
         all_upos = [t.upos for s in sentences for t in s.regular_tokens()]
         self.upos_vocab = upos_vocab or _build_vocab(all_upos)
 
-        all_input_chars = [c for s in sentences for t in s.regular_tokens() for c in t.form]
         all_output_chars = [c for s in sentences for t in s.regular_tokens() for c in t.lemma]
 
-        self.input_vocab = input_vocab or _build_vocab(all_input_chars, initial_vocab={"<PAD>": 0, "<UNK>": 1, "<SOS>": 2, "<EOS>": 3})
         self.output_vocab = output_vocab or _build_vocab(all_output_chars, initial_vocab={"<PAD>": 0, "<UNK>": 1, "<SOS>": 2, "<EOS>": 3}) 
         self.sentences = sentences
 
@@ -408,7 +405,6 @@ class LemmatizerDataset(Dataset):
             "input_ids": self.hf_tok.pad_token_id,
             "attention_mask": 0,
             "upos_ids": 0,
-            "input_char_ids": torch.tensor([[0]]),
             "output_char_ids": torch.tensor([[-100]]),
         }
         output={}
@@ -472,9 +468,7 @@ class LemmatizerDataset(Dataset):
         upos_ids = torch.zeros(seq_len, dtype=torch.long)
         all_words=[t.form for t in tokens]+['']
         all_lemmas=[t.lemma for t in tokens]+['']
-        input_encoded = self.encode_chars(all_words, self.input_vocab)
         output_encoded = self.encode_chars(all_lemmas, self.output_vocab)
-        input_char_ids = []
         output_char_ids = []
         seen_words = set()
         for i, word_id in enumerate(word_ids):
@@ -485,17 +479,14 @@ class LemmatizerDataset(Dataset):
                 upos_ids[i] = self.upos_vocab.get(tok.upos, self.upos_vocab["<UNK>"])
             if word_id not in seen_words and tok is not None:
                 seen_words.add(word_id)
-                input_char_ids.append(input_encoded[word_id])
                 output_char_ids.append(output_encoded[word_id])
             else:
-                input_char_ids.append(input_encoded[-1])
                 output_char_ids.append(output_encoded[-1])
 
         return {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "upos_ids": upos_ids,
-            "input_char_ids": input_char_ids,
             "output_char_ids": output_char_ids
         }
 
