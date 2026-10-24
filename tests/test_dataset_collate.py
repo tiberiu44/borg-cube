@@ -1,3 +1,5 @@
+from src.data.conllu import Sentence, Token
+from src.data.dataset import LemmatizerDataset
 import torch
 
 from src.data.dataset import (
@@ -115,6 +117,42 @@ def test_lemmatizer_collate_pads_inputs_and_targets():
     assert batch["output_char_ids"].shape == (2, 2, 3)
     assert batch["input_char_ids"][1, 1].tolist() == [0, 0, 0]
     assert batch["output_char_ids"][1, 1].tolist() == [-100, -100, -100]
+
+
+def test_lemmatizer_dataset_truncates_word_and_lemma_characters(monkeypatch):
+    class Encoding(dict):
+        def word_ids(self, batch_index=0):
+            return [None, 0, None]
+
+    class FakeTokenizer:
+        pad_token_id = 0
+
+        def __call__(self, forms, **kwargs):
+            self.forms = forms
+            return Encoding(
+                input_ids=torch.tensor([[1, 2, 3]]),
+                attention_mask=torch.tensor([[1, 1, 1]]),
+            )
+
+    tokenizer = FakeTokenizer()
+    monkeypatch.setattr(
+        "src.data.dataset._load_tokenizer",
+        lambda _: tokenizer,
+    )
+    form = "a" * 50 + "z" * 10
+    lemma = "b" * 50 + "y" * 10
+    dataset = LemmatizerDataset(
+        [Sentence(tokens=[Token(id=1, form=form, lemma=lemma)])],
+        "unused",
+    )
+
+    item = dataset[0]
+
+    assert tokenizer.forms == [form[:50]]
+    assert item["input_char_ids"][0].numel() == 52
+    assert item["output_char_ids"][0].numel() == 52
+    assert "z" not in dataset.input_vocab
+    assert "y" not in dataset.output_vocab
 
 
 def test_mwt_collate_pads_only_source_and_expansion_sequences():

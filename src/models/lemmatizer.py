@@ -15,6 +15,7 @@ from transformers import get_linear_schedule_with_warmup
 from src.config import BorgConfig
 from src.data.conllu import Sentence, Token
 from src.data.dataset import (
+    LEMMATIZER_MAX_CHAR_LENGTH,
     LemmatizerDataset,
     _build_vocab
 )
@@ -243,10 +244,16 @@ class LemmatizerModel(BorgBaseModel):
             for t in s.regular_tokens()
         ]
         all_input_chars = [
-            c for s in train_sentences for t in s.regular_tokens() for c in t.form
+            c
+            for s in train_sentences
+            for t in s.regular_tokens()
+            for c in t.form[:LEMMATIZER_MAX_CHAR_LENGTH]
         ]
         all_output_chars = [
-            c for s in train_sentences for t in s.regular_tokens() for c in t.lemma 
+            c
+            for s in train_sentences
+            for t in s.regular_tokens()
+            for c in t.lemma[:LEMMATIZER_MAX_CHAR_LENGTH]
         ]
 
 
@@ -415,7 +422,40 @@ class LemmatizerModel(BorgBaseModel):
         self.eval()
         self.to(device)
         results = list(sentences)
-        for batch in sentence_batches(self, sentences, show_progress=show_progress):
+        inference_sentences = []
+        inference_regular_indices = []
+        for sentence_index, sent in enumerate(sentences):
+            eligible_tokens = []
+            eligible_regular_indices = []
+            regular_index = 0
+            has_oversized_token = False
+            result_tokens = []
+            for token in sent.tokens:
+                if token.is_multiword() or token.is_empty():
+                    result_tokens.append(token)
+                else:
+                    if len(token.form) > LEMMATIZER_MAX_CHAR_LENGTH:
+                        has_oversized_token = True
+                        result_tokens.append(replace(token, lemma=token.form))
+                    else:
+                        eligible_tokens.append(token)
+                        eligible_regular_indices.append(regular_index)
+                        result_tokens.append(token)
+                    regular_index += 1
+
+            inference_sentences.append(Sentence(tokens=eligible_tokens))
+            inference_regular_indices.append(eligible_regular_indices)
+            if has_oversized_token:
+                results[sentence_index] = Sentence(
+                    tokens=result_tokens,
+                    comments=sent.comments,
+                )
+
+        for batch in sentence_batches(
+            self,
+            inference_sentences,
+            show_progress=show_progress,
+        ):
             if batch.input_char_ids is None:
                 raise RuntimeError("Lemmatizer inference requires input character IDs")
             upos_ids = torch.zeros_like(batch.input_ids)
@@ -445,7 +485,8 @@ class LemmatizerModel(BorgBaseModel):
                 sent = sentences[index]
                 sequence_width = batch.input_ids.shape[1] - 2
                 word_lemmas = {
-                    word_id: lemmas[row * sequence_width + position - 1]
+                    inference_regular_indices[index][word_id]:
+                        lemmas[row * sequence_width + position - 1]
                     for word_id, position in batch.word_positions[row].items()
                 }
                 new_sent = Sentence(comments=sent.comments)
@@ -454,9 +495,12 @@ class LemmatizerModel(BorgBaseModel):
                     if tok.is_multiword() or tok.is_empty():
                         new_sent.tokens.append(tok)
                         continue
-                    new_sent.tokens.append(
-                        replace(tok, lemma=word_lemmas.get(word_id, tok.lemma))
+                    lemma = (
+                        tok.form
+                        if len(tok.form) > LEMMATIZER_MAX_CHAR_LENGTH
+                        else word_lemmas.get(word_id, tok.lemma)
                     )
+                    new_sent.tokens.append(replace(tok, lemma=lemma))
                     word_id += 1
                 results[index] = new_sent
 

@@ -217,6 +217,30 @@ def test_lemmatizer_predicts_in_token_batches_and_preserves_alignment():
     assert any(shape[1] > 4 for shape in observed_context_batches)
 
 
+def test_lemmatizer_returns_oversized_words_as_their_own_lemmas():
+    model = make_model(LemmatizerModel, 3)
+    long_word = "x" * 51
+    inputs = [
+        Sentence(
+            tokens=[
+                Token(id=1, form="ab", upos="NOUN"),
+                Token(id=2, form=long_word, lemma="old", upos="NOUN"),
+                Token(id=3, form="cd", upos="NOUN"),
+            ]
+        )
+    ]
+
+    model.forward = Mock(return_value={"strings": ["lemma-ab", "lemma-cd"]})
+    actual = model.predict(inputs, show_progress=False)
+
+    assert model.hf_tokenizer.call_args.args[0] == [["ab", "cd"]]
+    assert [token.lemma for token in actual[0].regular_tokens()] == [
+        "lemma-ab",
+        long_word,
+        "lemma-cd",
+    ]
+
+
 def test_lemmatizer_original_decoder_shapes():
     model = make_model(LemmatizerModel, 2)
     decoder_inputs = []
