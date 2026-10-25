@@ -53,6 +53,7 @@ class TokenizerDataset(Dataset):
         show_progress: bool = False,
     ):
         self.max_length = max_length
+        from transformers import AutoTokenizer
         self.hf_tok = AutoTokenizer.from_pretrained(hf_tokenizer_name)
         self.examples: List[Tuple[str, List[int]]] = []
         self._build_examples(sentences, show_progress=show_progress)
